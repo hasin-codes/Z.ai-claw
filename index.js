@@ -7,7 +7,10 @@ const {
   ChannelType,
   MessageFlags
 } = require('discord.js');
-const fs = require('fs');
+const fs   = require('fs');
+const pino = require('pino');
+
+const log = pino({ level: 'info' }, pino.destination(1));
 
 const {
   createIssue,
@@ -20,6 +23,8 @@ const {
 const { forwardToTeam, pingRoleInThread } = require('./lib/forward');
 const { createReportThread }              = require('./lib/forum');
 const { runReminderJob }                  = require('./lib/reminders');
+const { startWorkers, stopWorkers }       = require('./lib/workers');
+const { addForwardJob }                   = require('./lib/queue');
 
 // ─── Client setup ────────────────────────────────────────────────────
 const client = new Client({
@@ -43,14 +48,27 @@ for (const file of commandFiles) {
 
 // ─── Ready ────────────────────────────────────────────────────────────
 client.once('clientReady', () => {
-  console.log(`Online as ${client.user.tag}`);
-  console.log(`Serving ${client.guilds.cache.size} server(s)`);
+  log.info({ tag: client.user.tag, guilds: client.guilds.cache.size }, 'Bot online');
 
-  // Run reminder job every hour
+  // Start BullMQ workers — pass client so workers can call Discord API
+  startWorkers(client);
+
+  // Reminder job every hour + once 30s after startup
   setInterval(() => runReminderJob(client), 60 * 60 * 1000);
-
-  // Run once 30 seconds after startup to catch anything already stale
   setTimeout(() => runReminderJob(client), 30 * 1000);
+});
+
+// Graceful shutdown — close workers cleanly when process exits
+process.on('SIGTERM', async () => {
+  log.info('SIGTERM received — shutting down gracefully');
+  await stopWorkers();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  log.info('SIGINT received — shutting down gracefully');
+  await stopWorkers();
+  process.exit(0);
 });
 
 // ─── Forum thread auto-detection ─────────────────────────────────────
@@ -184,8 +202,11 @@ client.on('threadCreate', async (thread, newlyCreated) => {
     console.error('[threadCreate] Could not ping role:', err.message);
   }
 
-  // Forward to department channel
-  await forwardToTeam(client, issue, user);
+  // Queue the forward job instead of calling directly
+  await addForwardJob({
+    issueId: issue.short_id,
+    userId:  user.id
+  });
 
   console.log(`[threadCreate] Issue ${issue.short_id} created and processed`);
 });
@@ -303,8 +324,11 @@ async function handleReportModal(interaction) {
     }
   }
 
-  // Forward to department channel
-  await forwardToTeam(interaction.client, issue, user);
+  // Queue the forward job instead of calling directly
+  await addForwardJob({
+    issueId: issue.short_id,
+    userId:  user.id
+  });
 
   // Ephemeral reply to user
   const lines = [

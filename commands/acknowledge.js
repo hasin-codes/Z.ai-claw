@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { getIssueByShortId, updateStatus } = require('../lib/issues');
-const { notifyUser } = require('../lib/notify');
+const { addNotifyJob } = require('../lib/queue');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -15,7 +15,7 @@ module.exports = {
   async execute(interaction) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const shortId = interaction.options.getString('issue_id').toUpperCase();
+    const shortId = interaction.options.getString('issue_id');
     const issue   = await getIssueByShortId(shortId);
 
     if (!issue) {
@@ -24,7 +24,7 @@ module.exports = {
 
     if (issue.status !== 'open') {
       return interaction.editReply({
-        content: `**${shortId}** is already ${issue.status} — no need to acknowledge again.`
+        content: `**${issue.short_id}** is already ${issue.status}.`
       });
     }
 
@@ -35,15 +35,14 @@ module.exports = {
       note:      'Issue acknowledged by team'
     });
 
-    await notifyUser(
-      interaction.client,
-      issue,
-      'acknowledged',
-      'A team member has seen your issue and will look into it.'
-    );
+    await addNotifyJob({
+      issueId:   issue.short_id,
+      newStatus: 'acknowledged',
+      note:      'A team member has seen your issue and will look into it.'
+    });
 
     await interaction.editReply({
-      content: `**${shortId}** marked as acknowledged. User has been notified via thread and DM.`
+      content: `**${issue.short_id}** marked as acknowledged. User will be notified.`
     });
   }
 };

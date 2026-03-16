@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { getIssueByShortId, updateStatus } = require('../lib/issues');
-const { notifyUser } = require('../lib/notify');
+const { addNotifyJob } = require('../lib/queue');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -20,7 +20,7 @@ module.exports = {
   async execute(interaction) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const shortId = interaction.options.getString('issue_id').toUpperCase();
+    const shortId = interaction.options.getString('issue_id');
     const note    = interaction.options.getString('note') || 'Your issue has been resolved.';
     const issue   = await getIssueByShortId(shortId);
 
@@ -30,7 +30,7 @@ module.exports = {
 
     if (issue.status === 'resolved' || issue.status === 'closed') {
       return interaction.editReply({
-        content: `**${shortId}** is already ${issue.status}.`
+        content: `**${issue.short_id}** is already ${issue.status}.`
       });
     }
 
@@ -45,10 +45,15 @@ module.exports = {
       return interaction.editReply({ content: `Failed to update status. Try again.` });
     }
 
-    await notifyUser(interaction.client, issue, 'resolved', note);
+    // Queue notification instead of calling directly
+    await addNotifyJob({
+      issueId:   issue.short_id,
+      newStatus: 'resolved',
+      note
+    });
 
     await interaction.editReply({
-      content: `**${shortId}** marked as resolved. User has been notified via thread and DM.`
+      content: `**${issue.short_id}** marked as resolved. User will be notified.`
     });
   }
 };

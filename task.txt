@@ -1,641 +1,596 @@
----
+Perfect. Let's build V6.
 
-## Step 2 — Update `lib/issues.js`
+Add these to your `.env` and Railway environment variables:
 
-Add these two functions at the bottom before `module.exports`:
-
-```js
-// Check if user has a similar open issue already
-// Simple approach: check if any open issue title shares significant words
-async function findSimilarOpenIssue(discordId, title) {
-  const { data, error } = await supabase
-    .from('issues')
-    .select('short_id, title, status, thread_id')
-    .eq('user_discord_id', discordId)
-    .not('status', 'in', '("resolved","closed")')
-    .order('created_at', { ascending: false });
-
-  if (error || !data || data.length === 0) return null;
-
-  // Extract meaningful words from new title (ignore short/common words)
-  const stopWords = new Set(['a','an','the','is','it','in','on','at','to','for',
-                             'of','and','or','but','not','my','i','cant','wont',
-                             'dont','can','with','was','has','have','from','this']);
-
-  const newWords = title.toLowerCase()
-    .split(/\s+/)
-    .filter(w => w.length > 3 && !stopWords.has(w));
-
-  for (const issue of data) {
-    const existingWords = issue.title.toLowerCase().split(/\s+/);
-    const matches = newWords.filter(w => existingWords.some(ew => ew.includes(w)));
-    // If 2 or more meaningful words match, flag as similar
-    if (matches.length >= 2) return issue;
-  }
-
-  return null;
-}
-
-// Mark an issue as reminded
-async function markReminded(issueId) {
-  const { error } = await supabase
-    .from('issues')
-    .update({
-      last_reminded_at: new Date().toISOString(),
-      reminder_count:   supabase.rpc('increment_reminder_count', { p_issue_id: issueId }),
-      updated_at:       new Date().toISOString()
-    })
-    .eq('id', issueId);
-
-  if (error) console.error('markReminded error:', error.message);
-}
-
-// Get issues that have been open 48hrs+ with no update and reminder count < 3
-async function getStaleIssues() {
-  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-
-  const { data, error } = await supabase
-    .from('issues')
-    .select('*')
-    .in('status', ['open', 'acknowledged'])
-    .lt('updated_at', cutoff)
-    .lt('reminder_count', 3);
-
-  if (error) {
-    console.error('getStaleIssues error:', error.message);
-    return [];
-  }
-  return data || [];
-}
+```
+CF_ACCOUNT_ID=
+CF_API_TOKEN=
+QDRANT_URL=
+QDRANT_API_KEY=
 ```
 
-Add them to `module.exports`:
+Then install the dependencies:
 
-```js
-module.exports = {
-  upsertUser,
-  createIssue,
-  attachThread,
-  saveMessage,
-  getIssueByShortId,
-  getUserOpenIssues,
-  updateStatus,
-  isAtIssueLimit,
-  findSimilarOpenIssue,   // new
-  markReminded,           // new
-  getStaleIssues          // new
-};
+```bash
+npm install @qdrant/js-client-rest openai
 ```
+
+We use the `openai` package pointed at Cloudflare's OpenAI-compatible endpoint — no custom SDK needed.
 
 ---
 
-## Step 3 — Add The Reminder Count Function In Supabase
+## Step 1 — New File: `lib/cloudflare.js`
 
-```sql
-create or replace function increment_reminder_count(p_issue_id uuid)
-returns void as $$
-begin
-  update issues
-  set reminder_count = reminder_count + 1
-  where id = p_issue_id;
-end;
-$$ language plpgsql;
-```
-
----
-
-## Step 4 — New File: `lib/notify.js`
-
-All user notification logic in one place — both DM and thread message. Every status change goes through here:
+Cloudflare Workers AI client for both embeddings and chat completions:
 
 ```js
-async function notifyUser(client, issue, newStatus, note) {
-  const STATUS_LABELS = {
-    open:         '🔴 Open',
-    acknowledged: '🟡 Acknowledged — a team member has seen your issue',
-    in_progress:  '🔵 In progress — someone is actively working on this',
-    resolved:     '🟢 Resolved',
-    closed:       '⚪ Closed'
-  };
-
-  const label = STATUS_LABELS[newStatus] || newStatus;
-
-  const lines = [
-    `**Update on ${issue.short_id}**`,
-    ``,
-    `Status: ${label}`,
-  ];
-
-  if (note) lines.push(``, `Note from team: ${note}`);
-
-  if (newStatus === 'resolved' || newStatus === 'closed') {
-    lines.push(``, `If your issue persists or comes back, feel free to file a new report.`);
-  }
-
-  const content = lines.join('\n');
-
-  // 1. Post inside the issue thread
-  if (issue.thread_id) {
-    try {
-      const thread = await client.channels.fetch(issue.thread_id);
-      if (thread) await thread.send({ content });
-    } catch (err) {
-      console.error(`Failed to notify in thread ${issue.thread_id}:`, err.message);
-    }
-  }
-
-  // 2. DM the user directly
-  try {
-    const user = await client.users.fetch(issue.user_discord_id);
-    if (user) {
-      const dmLines = [
-        `**Update on your issue ${issue.short_id}** — "${issue.title}"`,
-        ``,
-        `Status: ${label}`,
-      ];
-      if (note) dmLines.push(``, `Note from team: ${note}`);
-      if (newStatus === 'resolved' || newStatus === 'closed') {
-        dmLines.push(``, `If your issue comes back, file a new report in the server.`);
-      }
-      await user.send({ content: dmLines.join('\n') });
-    }
-  } catch (err) {
-    // DMs can fail if user has them disabled — not a critical error
-    if (err.code === 50007) {
-      console.warn(`User ${issue.user_discord_id} has DMs disabled`);
-    } else {
-      console.error(`Failed to DM user ${issue.user_discord_id}:`, err.message);
-    }
-  }
-}
-
-module.exports = { notifyUser };
-```
-
----
-
-## Step 5 — New File: `lib/reminders.js`
-
-This runs on a timer and pings roles for stale issues:
-
-```js
-const { getStaleIssues, markReminded } = require('./issues');
-const { pingRoleInThread } = require('./forward');
-
-async function runReminderJob(client) {
-  console.log('[reminders] Checking for stale issues...');
-
-  const staleIssues = await getStaleIssues();
-
-  if (staleIssues.length === 0) {
-    console.log('[reminders] No stale issues found');
-    return;
-  }
-
-  console.log(`[reminders] Found ${staleIssues.length} stale issue(s)`);
-
-  for (const issue of staleIssues) {
-    if (!issue.thread_id) continue;
-
-    let thread;
-    try {
-      thread = await client.channels.fetch(issue.thread_id);
-    } catch (err) {
-      console.error(`[reminders] Could not fetch thread ${issue.thread_id}:`, err.message);
-      continue;
-    }
-
-    // Post reminder in thread
-    try {
-      await thread.send({
-        content: [
-          `**Reminder — ${issue.short_id} has had no update in 48 hours.**`,
-          ``,
-          `This issue is still **${issue.status}** and the user is waiting.`,
-          `Use \`/acknowledge ${issue.short_id}\` or \`/resolve ${issue.short_id}\` to update it.`
-        ].join('\n')
-      });
-    } catch (err) {
-      console.error(`[reminders] Failed to post reminder in thread:`, err.message);
-      continue;
-    }
-
-    // Ping role inside the thread
-    await pingRoleInThread(client, thread, issue, 'new_issue');
-
-    // Mark as reminded so we don't repeat until another 48hrs passes
-    await markReminded(issue.id);
-
-    // Small delay between issues to avoid rate limits
-    await new Promise(r => setTimeout(r, 1000));
-  }
-}
-
-module.exports = { runReminderJob };
-```
-
----
-
-## Step 6 — New Command: `commands/close.js`
-
-Team-only close. Different from resolve — this is for spam, duplicates, or invalid reports:
-
-```js
-const { SlashCommandBuilder, MessageFlags } = require('discord.js');
-const { getIssueByShortId, updateStatus } = require('../lib/issues');
-const { notifyUser } = require('../lib/notify');
-
-module.exports = {
-  data: new SlashCommandBuilder()
-    .setName('close')
-    .setDescription('Close an issue without resolving (team only)')
-    .addStringOption(opt =>
-      opt.setName('issue_id')
-        .setDescription('Issue ID e.g. ISS-1001')
-        .setRequired(true)
-    )
-    .addStringOption(opt =>
-      opt.setName('reason')
-        .setDescription('Why this is being closed')
-        .setRequired(false)
-    ),
-
-  async execute(interaction) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-    const shortId = interaction.options.getString('issue_id').toUpperCase();
-    const reason  = interaction.options.getString('reason') || 'Closed by support team.';
-    const issue   = await getIssueByShortId(shortId);
-
-    if (!issue) {
-      return interaction.editReply({ content: `No issue found with ID **${shortId}**.` });
-    }
-
-    if (issue.status === 'resolved' || issue.status === 'closed') {
-      return interaction.editReply({
-        content: `**${shortId}** is already ${issue.status}.`
-      });
-    }
-
-    const success = await updateStatus({
-      issueId:   issue.id,
-      newStatus: 'closed',
-      changedBy: interaction.user.id,
-      note:      reason
-    });
-
-    if (!success) {
-      return interaction.editReply({ content: `Failed to close issue. Try again.` });
-    }
-
-    // Notify user in thread + DM
-    await notifyUser(interaction.client, issue, 'closed', reason);
-
-    await interaction.editReply({
-      content: `**${shortId}** has been closed. User has been notified.`
-    });
-  }
-};
-```
-
----
-
-## Step 7 — Update `commands/resolve.js` and `commands/acknowledge.js`
-
-Both need to use the new `notifyUser` instead of the old `postStatusUpdate`. Replace both files entirely:
-
-**`commands/resolve.js`:**
-
-```js
-const { SlashCommandBuilder, MessageFlags } = require('discord.js');
-const { getIssueByShortId, updateStatus } = require('../lib/issues');
-const { notifyUser } = require('../lib/notify');
-
-module.exports = {
-  data: new SlashCommandBuilder()
-    .setName('resolve')
-    .setDescription('Mark an issue as resolved (team only)')
-    .addStringOption(opt =>
-      opt.setName('issue_id')
-        .setDescription('Issue ID e.g. ISS-1001')
-        .setRequired(true)
-    )
-    .addStringOption(opt =>
-      opt.setName('note')
-        .setDescription('Resolution note to share with the user')
-        .setRequired(false)
-    ),
-
-  async execute(interaction) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-    const shortId = interaction.options.getString('issue_id').toUpperCase();
-    const note    = interaction.options.getString('note') || 'Your issue has been resolved.';
-    const issue   = await getIssueByShortId(shortId);
-
-    if (!issue) {
-      return interaction.editReply({ content: `No issue found with ID **${shortId}**.` });
-    }
-
-    if (issue.status === 'resolved' || issue.status === 'closed') {
-      return interaction.editReply({
-        content: `**${shortId}** is already ${issue.status}.`
-      });
-    }
-
-    const success = await updateStatus({
-      issueId:   issue.id,
-      newStatus: 'resolved',
-      changedBy: interaction.user.id,
-      note
-    });
-
-    if (!success) {
-      return interaction.editReply({ content: `Failed to update status. Try again.` });
-    }
-
-    await notifyUser(interaction.client, issue, 'resolved', note);
-
-    await interaction.editReply({
-      content: `**${shortId}** marked as resolved. User has been notified via thread and DM.`
-    });
-  }
-};
-```
-
-**`commands/acknowledge.js`:**
-
-```js
-const { SlashCommandBuilder, MessageFlags } = require('discord.js');
-const { getIssueByShortId, updateStatus } = require('../lib/issues');
-const { notifyUser } = require('../lib/notify');
-
-module.exports = {
-  data: new SlashCommandBuilder()
-    .setName('acknowledge')
-    .setDescription('Mark an issue as acknowledged (team only)')
-    .addStringOption(opt =>
-      opt.setName('issue_id')
-        .setDescription('Issue ID e.g. ISS-1001')
-        .setRequired(true)
-    ),
-
-  async execute(interaction) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-    const shortId = interaction.options.getString('issue_id').toUpperCase();
-    const issue   = await getIssueByShortId(shortId);
-
-    if (!issue) {
-      return interaction.editReply({ content: `No issue found with ID **${shortId}**.` });
-    }
-
-    if (issue.status !== 'open') {
-      return interaction.editReply({
-        content: `**${shortId}** is already ${issue.status} — no need to acknowledge again.`
-      });
-    }
-
-    await updateStatus({
-      issueId:   issue.id,
-      newStatus: 'acknowledged',
-      changedBy: interaction.user.id,
-      note:      'Issue acknowledged by team'
-    });
-
-    await notifyUser(
-      interaction.client,
-      issue,
-      'acknowledged',
-      'A team member has seen your issue and will look into it.'
-    );
-
-    await interaction.editReply({
-      content: `**${shortId}** marked as acknowledged. User has been notified via thread and DM.`
-    });
-  }
-};
-```
-
----
-
-## Step 8 — Update `index.js`
-
-Add duplicate detection to `handleReportModal`, wire up the reminder job, and fix the deprecation warnings. Replace your entire `index.js`:
-
-```js
-require('dotenv').config();
-const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  Collection,
-  ChannelType,
-  MessageFlags
-} = require('discord.js');
-const fs = require('fs');
-const {
-  createIssue,
-  attachThread,
-  saveMessage,
-  isAtIssueLimit,
-  findSimilarOpenIssue
-} = require('./lib/issues');
-const { forwardToTeam, pingRoleInThread } = require('./lib/forward');
-const { createReportThread }              = require('./lib/forum');
-const { runReminderJob }                  = require('./lib/reminders');
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-  ],
-  partials: [Partials.Channel]
+const OpenAI = require('openai');
+
+const cf = new OpenAI({
+  apiKey:  process.env.CF_API_TOKEN,
+  baseURL: `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/ai/v1`
 });
 
-// Load commands
-client.commands = new Collection();
-const commandFiles = fs.readdirSync('./commands').filter(f => f.endsWith('.js'));
-for (const file of commandFiles) {
-  const command = require(`./commands/${file}`);
-  client.commands.set(command.data.name, command);
-}
+const EMBEDDING_MODEL = '@cf/qwen/qwen3-embedding-0.6b';
+const CHAT_MODEL      = '@cf/qwen/qwen3-30b-a3b-fp8';
 
-client.once('clientReady', () => {
-  console.log(`Online as ${client.user.tag}`);
-
-  // Run reminder job every hour
-  setInterval(() => runReminderJob(client), 60 * 60 * 1000);
-
-  // Also run once 30 seconds after startup to catch anything stale
-  setTimeout(() => runReminderJob(client), 30 * 1000);
-});
-
-client.on('interactionCreate', async interaction => {
-
-  if (interaction.isChatInputCommand()) {
-    const command = client.commands.get(interaction.commandName);
-    if (!command) return;
-    try {
-      await command.execute(interaction);
-    } catch (err) {
-      console.error(`Error in /${interaction.commandName}:`, err);
-      const msg = { content: 'Something went wrong. Please try again.', flags: MessageFlags.Ephemeral };
-      if (interaction.replied || interaction.deferred) {
-        await interaction.followUp(msg);
-      } else {
-        await interaction.reply(msg);
-      }
-    }
-    return;
-  }
-
-  if (interaction.isModalSubmit() && interaction.customId === 'report_modal') {
-    await handleReportModal(interaction);
-    return;
-  }
-});
-
-async function handleReportModal(interaction) {
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  const title       = interaction.fields.getTextInputValue('issue_title');
-  const description = interaction.fields.getTextInputValue('issue_description');
-  const stepsTried  = interaction.fields.getTextInputValue('issue_steps') || null;
-  const user        = interaction.user;
-
-  // Check issue limit
-  const atLimit = await isAtIssueLimit(user.id);
-  if (atLimit) {
-    return interaction.editReply({
-      content: [
-        `You already have 3 open issues — the maximum allowed.`,
-        `Use \`/myissues\` to see them. A team member needs to resolve one before you can open another.`
-      ].join('\n')
-    });
-  }
-
-  // Check for duplicate
-  const similar = await findSimilarOpenIssue(user.id, title);
-  if (similar) {
-    return interaction.editReply({
-      content: [
-        `You may already have a similar open issue: **${similar.short_id}** — "${similar.title}"`,
-        ``,
-        `If this is the same problem, use \`/status ${similar.short_id}\` to check on it.`,
-        `If this is a different issue, please add more specific detail to the title and try again.`
-      ].join('\n')
-    });
-  }
-
-  // Create issue
-  let issue;
-  try {
-    issue = await createIssue({
-      user,
-      guild:   interaction.guild,
-      channel: interaction.channel,
-      title,
-      description,
-      stepsTried
-    });
-  } catch (err) {
-    console.error('createIssue failed:', err.message);
-    return interaction.editReply({
-      content: 'Something went wrong saving your issue. Please try again.'
-    });
-  }
-
-  // Save initial message
-  await saveMessage({
-    issueId: issue.id,
-    role:    'user',
-    content: `Title: ${title}\nDescription: ${description}\nSteps tried: ${stepsTried || 'None'}`
+// Embed a single string — returns a float array
+async function embed(text) {
+  const response = await cf.embeddings.create({
+    model: EMBEDDING_MODEL,
+    input: text.slice(0, 8000) // safety trim
   });
+  return response.data[0].embedding;
+}
 
-  // Create forum thread
-  const thread = await createReportThread(interaction.client, issue, user);
+// Embed multiple strings in one call — returns array of float arrays
+async function embedBatch(texts) {
+  const response = await cf.embeddings.create({
+    model: EMBEDDING_MODEL,
+    input: texts.map(t => t.slice(0, 8000))
+  });
+  return response.data.map(d => d.embedding);
+}
 
-  if (thread) {
-    await attachThread(issue.id, thread.id);
-    issue.thread_id = thread.id;
+// Chat completion with strict system prompt
+async function chat(systemPrompt, messages) {
+  const response = await cf.chat.completions.create({
+    model:       CHAT_MODEL,
+    temperature: 0.1, // low temp = more deterministic, less hallucination
+    messages: [
+      { role: 'system', content: systemPrompt },
+      ...messages
+    ]
+  });
+  return response.choices[0].message.content;
+}
 
+module.exports = { embed, embedBatch, chat, EMBEDDING_MODEL };
+```
+
+---
+
+## Step 2 — New File: `lib/qdrant.js`
+
+Qdrant client with collection setup and search:
+
+```js
+const { QdrantClient } = require('@qdrant/js-client-rest');
+
+const client = new QdrantClient({
+  url:    process.env.QDRANT_URL,
+  apiKey: process.env.QDRANT_API_KEY
+});
+
+// Collection names — one per tier
+const COLLECTIONS = {
+  docs:     'docs_chunks',       // Tier 1 — your markdown docs
+  cases:    'resolved_cases',    // Tier 2 — resolved issue summaries (V7)
+  tribal:   'tribal_knowledge',  // Tier 3 — staff solutions (V8)
+  community:'community_knowledge' // V8 — bad-report channel indexing
+};
+
+const VECTOR_SIZE = 1024; // Qwen3-embedding-0.6b output dimension
+
+// Create a collection if it doesn't exist
+async function ensureCollection(name) {
+  try {
+    await client.getCollection(name);
+    console.log(`[qdrant] Collection "${name}" already exists`);
+  } catch {
+    await client.createCollection(name, {
+      vectors: {
+        size:     VECTOR_SIZE,
+        distance: 'Cosine'
+      }
+    });
+    console.log(`[qdrant] Collection "${name}" created`);
+  }
+}
+
+// Upsert points into a collection
+async function upsert(collectionName, points) {
+  await client.upsert(collectionName, {
+    wait:   true,
+    points
+  });
+}
+
+// Search a collection — returns top K results with scores
+async function search(collectionName, vector, limit = 5, filter = null) {
+  const params = { vector, limit, with_payload: true };
+  if (filter) params.filter = filter;
+
+  const results = await client.search(collectionName, params);
+  return results;
+}
+
+// Initialize all collections on startup
+async function initCollections() {
+  for (const name of Object.values(COLLECTIONS)) {
+    await ensureCollection(name);
+  }
+}
+
+module.exports = { client, COLLECTIONS, upsert, search, initCollections };
+```
+
+---
+
+## Step 3 — New File: `lib/rag.js`
+
+The full RAG pipeline — search, build context, generate answer, handle escalation:
+
+```js
+const { embed, chat }     = require('./cloudflare');
+const { search, COLLECTIONS } = require('./qdrant');
+const { pingRoleInThread }    = require('./forward');
+const { saveMessage }         = require('./issues');
+
+// Confidence thresholds
+const THRESHOLD_ANSWER   = 0.80; // above this → answer directly
+const THRESHOLD_CAUTIOUS = 0.65; // above this → answer with caveat
+                                  // below this → escalate
+
+const SYSTEM_PROMPT = `You are a support assistant for our product.
+Your job is to help users by answering questions based ONLY on the provided context.
+
+Rules you must follow without exception:
+1. ONLY answer using information from the context provided below.
+2. If the context does not contain enough information to answer, respond with exactly: ESCALATE
+3. Never guess, infer, or use knowledge outside the provided context.
+4. Keep answers concise and friendly.
+5. If you find a relevant answer, cite which document or past case it came from.
+6. Never make up features, policies, or procedures that aren't in the context.
+
+Context:
+{CONTEXT}`;
+
+async function answerInThread(client, thread, issue, userMessage) {
+  let embedding;
+  try {
+    embedding = await embed(userMessage);
+  } catch (err) {
+    console.error('[rag] Embedding failed:', err.message);
+    return false;
+  }
+
+  // Search Tier 1 (docs) — primary source
+  let tier1Results = [];
+  try {
+    tier1Results = await search(COLLECTIONS.docs, embedding, 4);
+  } catch (err) {
+    console.error('[rag] Tier 1 search failed:', err.message);
+  }
+
+  // Search Tier 2 (resolved cases) — secondary source
+  // Filter by same department for better relevance
+  let tier2Results = [];
+  try {
+    tier2Results = await search(
+      COLLECTIONS.cases,
+      embedding,
+      3,
+      issue.department ? {
+        must: [{ key: 'department', match: { value: issue.department } }]
+      } : null
+    );
+  } catch (err) {
+    // Tier 2 might be empty in V6 — not an error
+    console.log('[rag] Tier 2 search skipped (empty or error):', err.message);
+  }
+
+  // Find the best score across both tiers
+  const allResults  = [...tier1Results, ...tier2Results];
+  const bestScore   = allResults.length > 0
+    ? Math.max(...allResults.map(r => r.score))
+    : 0;
+
+  console.log(`[rag] Best score: ${bestScore.toFixed(3)} across ${allResults.length} results`);
+
+  // Below threshold — escalate, don't try to answer
+  if (bestScore < THRESHOLD_CAUTIOUS || allResults.length === 0) {
+    await escalate(client, thread, issue, userMessage);
+    return true;
+  }
+
+  // Build context string from top results
+  const contextParts = allResults
+    .filter(r => r.score >= THRESHOLD_CAUTIOUS)
+    .slice(0, 5)
+    .map(r => {
+      const src = r.payload.source || 'documentation';
+      return `[Source: ${src}]\n${r.payload.content}`;
+    })
+    .join('\n\n---\n\n');
+
+  const prompt = SYSTEM_PROMPT.replace('{CONTEXT}', contextParts);
+
+  // Call the LLM
+  let answer;
+  try {
+    answer = await chat(prompt, [
+      { role: 'user', content: userMessage }
+    ]);
+  } catch (err) {
+    console.error('[rag] LLM call failed:', err.message);
+    await escalate(client, thread, issue, userMessage);
+    return true;
+  }
+
+  // LLM decided to escalate
+  if (answer.trim().toUpperCase().startsWith('ESCALATE')) {
+    await escalate(client, thread, issue, userMessage);
+    return true;
+  }
+
+  // Build the reply based on confidence level
+  const lines = [];
+
+  if (bestScore >= THRESHOLD_ANSWER) {
+    // High confidence — answer directly
+    lines.push(answer);
+  } else {
+    // Medium confidence — answer with caveat
+    lines.push(answer);
+    lines.push('');
+    lines.push(`*Based on a similar past case — if this doesn't match your situation exactly, a team member can help further.*`);
+  }
+
+  // Send answer in thread
+  try {
+    const msg = await thread.send({ content: lines.join('\n') });
+
+    // Save bot response to issue_messages
     await saveMessage({
       issueId:      issue.id,
       role:         'assistant',
-      content:      `Issue ${issue.short_id} forum post created.`,
-      discordMsgId: thread.id
+      content:      answer,
+      discordMsgId: msg.id
     });
-
-    // Wait for thread to initialize then ping role
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    try {
-      const liveThread = await interaction.client.channels.fetch(thread.id);
-      await pingRoleInThread(interaction.client, liveThread, issue, 'new_issue');
-    } catch (err) {
-      console.error('Could not ping role in thread:', err.message);
-    }
+  } catch (err) {
+    console.error('[rag] Failed to send answer in thread:', err.message);
   }
 
-  // Forward to department channel
-  await forwardToTeam(interaction.client, issue, user);
-
-  // Reply to user
-  const lines = [
-    `Your issue has been reported as **${issue.short_id}**.`,
-    `Department: **${issue.department}**`,
-    ``
-  ];
-
-  if (thread) lines.push(`Your thread: <#${thread.id}>`);
-
-  lines.push(`Use \`/status ${issue.short_id}\` to check for updates.`);
-  lines.push(`Use \`/myissues\` to see all your open issues.`);
-
-  await interaction.editReply({ content: lines.join('\n') });
+  return true;
 }
 
-client.login(process.env.DISCORD_TOKEN);
+async function escalate(client, thread, issue, userMessage) {
+  console.log(`[rag] Escalating issue ${issue.short_id} — no answer found`);
+
+  // Tell user what's happening — transparently
+  const userLines = [
+    `I wasn't able to find a clear answer to your question in our documentation or past cases.`,
+    ``,
+    `I've flagged this for a team member who will follow up here shortly.`
+  ];
+
+  try {
+    await thread.send({ content: userLines.join('\n') });
+  } catch (err) {
+    console.error('[rag] Failed to send escalation message to user:', err.message);
+  }
+
+  // Ping role inside thread with context
+  await pingRoleInThread(client, thread, issue, 'escalation');
+
+  // Save escalation to messages
+  await saveMessage({
+    issueId: issue.id,
+    role:    'system',
+    content: `RAG escalation — no answer found for: "${userMessage}"`
+  });
+}
+
+module.exports = { answerInThread };
 ```
 
 ---
 
-## Step 9 — Register New Commands and Restart
+## Step 4 — New Script: `scripts/ingest.js`
+
+Run this once to embed your docs. Drop any `.md` files in a `/docs` folder and run it — it chunks them and upserts into Qdrant:
+
+```js
+require('dotenv').config();
+const fs   = require('fs');
+const path = require('path');
+const { embedBatch }          = require('../lib/cloudflare');
+const { upsert, ensureCollection, COLLECTIONS } = require('../lib/qdrant');
+const { v4: uuidv4 }          = require('uuid');
+
+const DOCS_DIR    = path.join(__dirname, '../docs');
+const CHUNK_SIZE  = 400;  // words per chunk
+const CHUNK_OVERLAP = 50; // word overlap between chunks
+
+function chunkText(text, size, overlap) {
+  const words  = text.split(/\s+/);
+  const chunks = [];
+
+  for (let i = 0; i < words.length; i += (size - overlap)) {
+    const chunk = words.slice(i, i + size).join(' ');
+    if (chunk.trim().length > 50) { // skip tiny chunks
+      chunks.push(chunk);
+    }
+    if (i + size >= words.length) break;
+  }
+
+  return chunks;
+}
+
+async function ingestFile(filePath) {
+  const filename = path.basename(filePath);
+  const raw      = fs.readFileSync(filePath, 'utf8');
+
+  console.log(`\nIngesting: ${filename} (${raw.length} chars)`);
+
+  const chunks = chunkText(raw, CHUNK_SIZE, CHUNK_OVERLAP);
+  console.log(`  → ${chunks.length} chunks`);
+
+  if (chunks.length === 0) {
+    console.log(`  → Skipped (no content)`);
+    return;
+  }
+
+  // Embed all chunks in one batch call
+  const embeddings = await embedBatch(chunks);
+
+  // Build Qdrant points
+  const points = chunks.map((chunk, i) => ({
+    id:      uuidv4(),
+    vector:  embeddings[i],
+    payload: {
+      content:  chunk,
+      source:   filename,
+      chunk_index: i,
+      ingested_at: new Date().toISOString()
+    }
+  }));
+
+  await upsert(COLLECTIONS.docs, points);
+  console.log(`  → Upserted ${points.length} points into Qdrant`);
+}
+
+async function main() {
+  console.log('Starting doc ingestion...');
+
+  // Make sure the collection exists
+  const { ensureCollection } = require('../lib/qdrant');
+  await ensureCollection(COLLECTIONS.docs);
+
+  if (!fs.existsSync(DOCS_DIR)) {
+    fs.mkdirSync(DOCS_DIR, { recursive: true });
+    console.log(`Created /docs folder — add your markdown files there and run again`);
+    return;
+  }
+
+  const files = fs.readdirSync(DOCS_DIR).filter(f => f.endsWith('.md'));
+
+  if (files.length === 0) {
+    console.log('No .md files found in /docs — add some and run again');
+    return;
+  }
+
+  for (const file of files) {
+    await ingestFile(path.join(DOCS_DIR, file));
+  }
+
+  console.log('\nIngestion complete.');
+}
+
+main().catch(err => {
+  console.error('Ingestion failed:', err);
+  process.exit(1);
+});
+```
+
+You need `uuid` installed:
 
 ```bash
-node deploy-commands.js
-node index.js
+npm install uuid
 ```
 
 ---
 
-## What To Test
+## Step 5 — Create A Test Doc
 
-**Test 1 — Duplicate detection**
-Submit `/report` with title `payment keeps failing`. Then immediately submit another `/report` with title `payment failing again`. Second one should be blocked and show the existing issue ID.
+Create folder `docs/` in your project root and add a test file `docs/general-faq.md`:
 
-**Test 2 — DM notification**
-Run `/acknowledge ISS-xxxx` on any open issue. Check two places: the forum thread should have a new status message, and your Discord DMs should have a message from the bot.
+```markdown
+# General FAQ
 
-**Test 3 — Close command**
-Run `/close ISS-xxxx reason:Duplicate report`. User gets DM'd and thread gets the closed message. `/status` should now show closed.
+## How do I reset my password?
+Go to the login page and click "Forgot Password". Enter your email and you will receive a reset link within 5 minutes. Check your spam folder if you don't see it.
 
-**Test 4 — Stale reminder (force test)**
-In Supabase SQL Editor run this to fake a stale issue:
+## How do I upgrade my plan?
+Go to Settings > Billing > Upgrade Plan. Select the plan you want and enter your payment details. The upgrade takes effect immediately.
 
-```sql
-update issues
-set updated_at = now() - interval '49 hours',
-    reminder_count = 0
-where status = 'open'
-limit 1;
+## How do I cancel my subscription?
+Go to Settings > Billing > Cancel Subscription. You will keep access until the end of your billing period. No refunds are given for partial months.
+
+## What payment methods do you accept?
+We accept Visa, Mastercard, American Express, and PayPal. We do not accept cryptocurrency.
+
+## How do I contact support?
+Use the /report command in our Discord server to file a support ticket. A team member will respond within 24 hours.
+
+## What are your support hours?
+Our support team is available Monday to Friday, 9am to 6pm UTC. Issues filed outside these hours will be addressed the next business day.
 ```
 
-Then restart the bot — the reminder job runs 30 seconds after startup. Check the terminal for `[reminders] Found 1 stale issue(s)` and check the forum thread for the reminder message.
+---
 
-**Test 5 — Issue limit message**
-Make sure the limit message now correctly says a team member needs to resolve one rather than the user being able to close it themselves.
+## Step 6 — Run The Ingestion Script
 
-All 5 pass and V4 is done.
+```bash
+node scripts/ingest.js
+```
+
+You should see:
+
+```
+Starting doc ingestion...
+[qdrant] Collection "docs_chunks" already exists
+Ingesting: general-faq.md (1243 chars)
+  → 3 chunks
+  → Upserted 3 points into Qdrant
+Ingestion complete.
+```
+
+---
+
+## Step 7 — Update `index.js`
+
+Add Qdrant init on startup and wire the message listener for threads. Add these imports at the top:
+
+```js
+const { initCollections }  = require('./lib/qdrant');
+const { answerInThread }   = require('./lib/rag');
+```
+
+In `clientReady`, add collection init:
+
+```js
+client.once('clientReady', async () => {
+  log.info({ tag: client.user.tag, guilds: client.guilds.cache.size }, 'Bot online');
+
+  // Init Qdrant collections
+  await initCollections();
+
+  startWorkers(client);
+  setInterval(() => runReminderJob(client), 60 * 60 * 1000);
+  setTimeout(() => runReminderJob(client), 30 * 1000);
+});
+```
+
+Then add this new event listener for messages inside threads. Add it after your `threadCreate` handler:
+
+```js
+// ─── Thread message listener ──────────────────────────────────────────
+// Watches messages inside issue threads and triggers RAG answering
+client.on('messageCreate', async message => {
+
+  // Ignore bots (including itself)
+  if (message.author.bot) return;
+
+  // Only care about messages inside threads
+  if (!message.channel.isThread()) return;
+
+  const thread = message.channel;
+
+  // Only handle threads that are inside our forum channel
+  if (thread.parentId !== process.env.BAD_REPORT_CHANNEL_ID) return;
+
+  const content = message.content.trim();
+  if (!content) return;
+
+  const isMention = message.mentions.has(client.user.id);
+
+  // If mentioned — answer immediately regardless
+  // If not mentioned — only answer if message looks like a question
+  const isQuestion = content.endsWith('?') ||
+    /^(how|what|why|when|where|can|does|is|are|do|will|should|could)/i.test(content);
+
+  if (!isMention && !isQuestion) return;
+
+  // Find the issue this thread belongs to
+  const supabase = require('./lib/supabase');
+  const { data: issue } = await supabase
+    .from('issues')
+    .select('*')
+    .eq('thread_id', thread.id)
+    .maybeSingle();
+
+  if (!issue) return; // thread not linked to an issue — ignore
+
+  // Don't answer already resolved/closed issues
+  if (issue.status === 'resolved' || issue.status === 'closed') return;
+
+  // Save user message to history
+  await saveMessage({
+    issueId:      issue.id,
+    role:         'user',
+    content,
+    discordMsgId: message.id
+  });
+
+  // Show typing indicator while we work
+  await thread.sendTyping();
+
+  // Run RAG
+  await answerInThread(client, thread, issue, content);
+});
+```
+
+---
+
+## Step 8 — Push and Test
+
+```bash
+git add .
+git commit -m "v6 RAG layer - Cloudflare AI + Qdrant"
+git push origin main
+```
+
+---
+
+## How To Test
+
+**Test 1 — Direct answer from docs**
+Go into any open issue thread. Type:
+`How do I reset my password?`
+Bot should reply with the answer from your FAQ within a few seconds.
+
+**Test 2 — Mention trigger**
+Type `@SupportKaizen what payment methods do you accept?`
+Should answer immediately.
+
+**Test 3 — Escalation**
+Type something totally unrelated to your docs:
+`Why is the sky blue?`
+Bot should say it can't find an answer and ping the relevant role.
+
+**Test 4 — Check terminal logs**
+Watch for lines like:
+```
+[rag] Best score: 0.891 across 4 results
+[rag] Best score: 0.412 across 4 results
+[rag] Escalating issue ISS-1008 — no answer found
+```
+
+This tells you exactly what the bot is doing and whether your thresholds need tuning. If good answers are getting escalated, lower `THRESHOLD_CAUTIOUS` from `0.65` to `0.60`. If bad answers are getting through, raise `THRESHOLD_ANSWER` from `0.80` to `0.85`.
+
+---
+
+## File Summary
+
+New files:
+- `lib/cloudflare.js`
+- `lib/qdrant.js`
+- `lib/rag.js`
+- `scripts/ingest.js`
+- `docs/general-faq.md` (test doc, replace with real docs later)
+
+Updated files:
+- `index.js` — Qdrant init + message listener
+- `package.json` — uuid, openai, @qdrant/js-client-rest

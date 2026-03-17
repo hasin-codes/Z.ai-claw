@@ -25,6 +25,8 @@ const { createReportThread }              = require('./lib/forum');
 const { runReminderJob }                  = require('./lib/reminders');
 const { startWorkers, stopWorkers }       = require('./lib/workers');
 const { addForwardJob }                   = require('./lib/queue');
+const { initCollections }                 = require('./lib/qdrant');
+const { answerInThread }                  = require('./lib/rag');
 
 // ─── Client setup ────────────────────────────────────────────────────
 const client = new Client({
@@ -47,8 +49,11 @@ for (const file of commandFiles) {
 }
 
 // ─── Ready ────────────────────────────────────────────────────────────
-client.once('clientReady', () => {
+client.once('clientReady', async () => {
   log.info({ tag: client.user.tag, guilds: client.guilds.cache.size }, 'Bot online');
+
+  // Init Qdrant collections
+  await initCollections();
 
   // Start BullMQ workers — pass client so workers can call Discord API
   startWorkers(client);
@@ -209,6 +214,61 @@ client.on('threadCreate', async (thread, newlyCreated) => {
   });
 
   console.log(`[threadCreate] Issue ${issue.short_id} created and processed`);
+});
+
+// ─── Thread message listener ──────────────────────────────────────────
+// Watches messages inside issue threads and triggers RAG answering
+client.on('messageCreate', async message => {
+
+  // Ignore bots (including itself)
+  if (message.author.bot) return;
+
+  // Only care about messages inside threads
+  if (!message.channel.isThread()) return;
+
+  const thread = message.channel;
+
+  // Only handle threads that are inside our forum channel
+  if (thread.parentId !== process.env.BAD_REPORT_CHANNEL_ID) return;
+
+  const content = message.content.trim();
+  if (!content) return;
+
+  const isMention = message.mentions.has(client.user.id);
+
+  // If mentioned — answer immediately regardless
+  // If not mentioned — only answer if message looks like a question
+  const isQuestion = content.endsWith('?') ||
+    /^(how|what|why|when|where|can|does|is|are|do|will|should|could)/i.test(content);
+
+  if (!isMention && !isQuestion) return;
+
+  // Find the issue this thread belongs to
+  const supabase = require('./lib/supabase');
+  const { data: issue } = await supabase
+    .from('issues')
+    .select('*')
+    .eq('thread_id', thread.id)
+    .maybeSingle();
+
+  if (!issue) return; // thread not linked to an issue — ignore
+
+  // Don't answer already resolved/closed issues
+  if (issue.status === 'resolved' || issue.status === 'closed') return;
+
+  // Save user message to history
+  await saveMessage({
+    issueId:      issue.id,
+    role:         'user',
+    content,
+    discordMsgId: message.id
+  });
+
+  // Show typing indicator while we work
+  await thread.sendTyping();
+
+  // Run RAG
+  await answerInThread(client, thread, issue, content);
 });
 
 // ─── Interaction handler ──────────────────────────────────────────────

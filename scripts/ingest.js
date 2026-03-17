@@ -6,9 +6,39 @@ const { upsert, ensureCollection, COLLECTIONS, VECTOR_SIZE } = require('../lib/q
 const { v4: uuidv4 }                       = require('uuid');
 
 const DOCS_DIR      = path.join(__dirname, '../docs');
-const CHUNK_SIZE    = 400;
-const CHUNK_OVERLAP = 50;
 
+// Split by markdown headers for better semantic chunking
+function chunkBySections(text) {
+  const sections = [];
+  const lines = text.split('\n');
+  let currentSection = '';
+  let currentHeader = '';
+  
+  for (const line of lines) {
+    // Detect markdown headers (## or ###)
+    const headerMatch = line.match(/^(#{1,3})\s+(.+)$/);
+    
+    if (headerMatch) {
+      // Save previous section if it has content
+      if (currentSection.trim().length > 50) {
+        sections.push(currentSection.trim());
+      }
+      currentSection = line + '\n';
+      currentHeader = headerMatch[2];
+    } else {
+      currentSection += line + '\n';
+    }
+  }
+  
+  // Don't forget the last section
+  if (currentSection.trim().length > 50) {
+    sections.push(currentSection.trim());
+  }
+  
+  return sections;
+}
+
+// Legacy chunking for non-markdown files
 function chunkText(text, size, overlap) {
   const words  = text.split(/\s+/);
   const chunks = [];
@@ -30,7 +60,10 @@ async function ingestFile(filePath) {
 
   console.log(`\nIngesting: ${filename} (${raw.length} chars)`);
 
-  const chunks = chunkText(raw, CHUNK_SIZE, CHUNK_OVERLAP);
+  // Use section-based chunking for markdown files
+  const chunks = filename.endsWith('.md') 
+    ? chunkBySections(raw) 
+    : chunkText(raw, 400, 50);
   console.log(`  → ${chunks.length} chunks`);
 
   if (chunks.length === 0) {

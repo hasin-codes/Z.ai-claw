@@ -26,7 +26,7 @@ const { runReminderJob }                  = require('./lib/reminders');
 const { startWorkers, stopWorkers }       = require('./lib/workers');
 const { addForwardJob }                   = require('./lib/queue');
 const { initCollections }                 = require('./lib/qdrant');
-const { answerInThread }                  = require('./lib/rag');
+const { runAgent }                       = require('./lib/agent');
 const supabase                            = require('./lib/supabase');
 
 // ─── Client setup ────────────────────────────────────────────────────
@@ -221,22 +221,15 @@ client.on('threadCreate', async (thread, newlyCreated) => {
 // Drop this entire block into index.js replacing the existing messageCreate handler
 
 client.on('messageCreate', async message => {
-
-  // Ignore bots
   if (message.author.bot) return;
-
-  // Only care about threads
   if (!message.channel.isThread()) return;
 
   const thread = message.channel;
-
-  // Only threads inside our report forum
   if (thread.parentId !== process.env.BAD_REPORT_CHANNEL_ID) return;
 
   const content = message.content.trim();
   if (!content) return;
 
-  // Find the issue this thread belongs to
   const { data: issue } = await supabase
     .from('issues')
     .select('*')
@@ -244,23 +237,13 @@ client.on('messageCreate', async message => {
     .maybeSingle();
 
   if (!issue) return;
-
-  // Don't answer resolved/closed issues
   if (issue.status === 'resolved' || issue.status === 'closed') return;
 
-  // Save user message to history
-  await saveMessage({
-    issueId:      issue.id,
-    role:         'user',
-    content,
-    discordMsgId: message.id
-  });
-
-  // Show typing indicator while processing
   await thread.sendTyping();
 
-  // rag.js decides everything from here — casual, question, escalate
-  await answerInThread(client, thread, issue, content);
+  // runAgent handles saving messages internally for non-casual intents
+  // For casual, it also saves. So we don't save here.
+  await runAgent(client, thread, issue, content);
 });
 
 // ─── Interaction handler ──────────────────────────────────────────────

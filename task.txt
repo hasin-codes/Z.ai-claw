@@ -1,4 +1,4 @@
-# V6.51 — Bug Fix Prompt
+# V6.51
 
 ## Context
 

@@ -1,19 +1,42 @@
-# General FAQ
+# General FAQ — Knowledge Base
 
-## How do I reset my password?
-Go to the login page and click "Forgot Password". Enter your email and you will receive a reset link within 5 minutes. Check your spam folder if you don't see it.
+---
 
-## How do I upgrade my plan?
-Go to Settings > Billing > Upgrade Plan. Select the plan you want and enter your payment details. The upgrade takes effect immediately.
+## How do I set up the GLM API for use with coding extensions like Kilo Code?
 
-## How do I cancel my subscription?
-Go to Settings > Billing > Cancel Subscription. You will keep access until the end of your billing period. No refunds are given for partial months.
+**Problem description:**
+Users trying to use GLM API with coding extensions (Kilo Code, OpenCode, Claude Code, etc.) receive errors even though they have an API key. The extensions fail to connect or return authentication errors, causing confusion about whether a paid Coding Plan is required.
 
-## What payment methods do you accept?
-We accept Visa, Mastercard, American Express, and PayPal. We do not accept cryptocurrency.
+**Solution:**
+You do **not** need to buy a Coding Plan to use the GLM API. Z.ai offers two different API usage modes, and the issue is usually caused by the Base URL (API Endpoint) configuration not matching your account's payment setup.
 
-## How do I contact support?
-Use the /report command in our Discord server to file a support ticket. A team member will respond within 24 hours.
+**Configuration Option 1: Pay-as-you-go (No Coding Plan required)**
+If you haven't bought a Coding Plan:
+1. Top up a small cash balance in your account
+2. Set the Base URL in your extension to the standard common endpoint:
+   ```
+   https://api.z.ai/api/paas/v4
+   ```
+3. You will be charged per request from your cash balance
 
-## What are your support hours?
-Our support team is available Monday to Friday, 9am to 6pm UTC. Issues filed outside these hours will be addressed the next business day.
+**Configuration Option 2: Coding Plan Subscription**
+If you have a Coding Plan (Lite/Pro/Max):
+1. You must use the dedicated coding endpoint
+2. Set the Base URL in your extension to:
+   ```
+   https://api.z.ai/api/coding/paas/v4
+   ```
+3. Requests will use your subscription quota, not cash balance
+
+**Important Notes:**
+- If you have a Coding Plan but use the standard endpoint (`/api/paas/v4`), the system will try to charge your cash balance and give you error `1113` "Insufficient balance"
+- Make sure your Kilo Code extension is updated to the latest version
+- Paste your API key without any hidden spaces
+- Verify your API key is active in your account settings
+
+**Common Error Codes:**
+- `1113` - Insufficient balance (usually wrong endpoint for your plan type)
+- `401` - Invalid API key (check for spaces or expired key)
+- `429` - Rate limit reached (see API Rate Limiting documentation)
+
+---

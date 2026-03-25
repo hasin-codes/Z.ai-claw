@@ -31,6 +31,7 @@ const { runAgent } = require('./lib/agent');
 const { updateThreadBrief } = require('./lib/context');
 const supabase = require('./lib/supabase');
 const ingestion = require('./lib/ingestion');
+const cleaning = require('./lib/cleaning');
 
 // ─── Client setup ────────────────────────────────────────────────────
 const client = new Client({
@@ -65,6 +66,9 @@ client.once('clientReady', async () => {
   // Init message ingestion system (backfill + batch writer)
   await ingestion.init(client);
 
+  // Start community message cleaning worker (every 5 minutes)
+  cleaning.start();
+
   // Reminder job every hour + once 30s after startup
   setInterval(() => runReminderJob(client), 60 * 60 * 1000);
   setTimeout(() => runReminderJob(client), 30 * 1000);
@@ -73,6 +77,7 @@ client.once('clientReady', async () => {
 // Graceful shutdown — close workers cleanly when process exits
 process.on('SIGTERM', async () => {
   log.info('SIGTERM received — shutting down gracefully');
+  cleaning.stop();
   await ingestion.shutdown();
   await stopWorkers();
   process.exit(0);
@@ -80,6 +85,7 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   log.info('SIGINT received — shutting down gracefully');
+  cleaning.stop();
   await ingestion.shutdown();
   await stopWorkers();
   process.exit(0);

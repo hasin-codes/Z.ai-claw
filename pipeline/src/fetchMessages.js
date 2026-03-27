@@ -37,43 +37,57 @@ async function fetchMessages(startTime, endTime) {
   const mode = startTime ? `backfill: ${backfillHours}h` : 'ALL (no time filter)';
   logger.info('fetchMessages', `Fetching messages (${mode}, channel: ${channelId || 'ALL'})`);
 
-  while (hasMore) {
+  // Temporary Cloudflare Free Tier Fix:
+  // Instead of fetching all history, fetch the latest 5000 messages if LIMIT_HISTORY is true
+  const forceLimit = process.env.LIMIT_HISTORY !== 'false'; // Defaults to restricting unless explicitly 'false'
+
+  if (!startTime && !endTime && forceLimit) {
+    logger.info('fetchMessages', 'Cloudflare Free-Tier Mode: Limiting "ALL" mode to latest 5000 messages');
     let query = supabase
       .from('community_messages_clean')
       .select(COLUMNS)
-      .gt('id', lastId)
-      .order('id', { ascending: true })
-      .limit(chunkSize);
+      .order('id', { ascending: false })
+      .limit(5000);
 
-    // Only filter by channel if GENERAL_CHAT_CHANNEL_ID is set
-    if (channelId) {
-      query = query.eq('channel_id', channelId);
-    }
-
-    // Apply time window ONLY if startTime/endTime are provided
-    if (startTime) {
-      query = query.gte('timestamp', startTime);
-    }
-    if (endTime) {
-      query = query.lt('timestamp', endTime);
-    }
+    if (channelId) query = query.eq('channel_id', channelId);
 
     const { data, error } = await query;
+    if (error) throw new Error(`fetchMessages Supabase error: ${error.message} (code: ${error.code})`);
 
-    if (error) {
-      throw new Error(`fetchMessages Supabase error: ${error.message} (code: ${error.code})`);
-    }
+    allMessages = data || [];
+    allMessages.reverse(); // Put them back in chronological order (oldest -> newest)
+  } else {
+    // Standard incremental logic for regular 12-hour background runs
+    let lastId = 0;
+    while (hasMore) {
+      let query = supabase
+        .from('community_messages_clean')
+        .select(COLUMNS)
+        .gt('id', lastId)
+        .order('id', { ascending: true })
+        .limit(chunkSize);
 
-    if (!data || data.length === 0) {
-      hasMore = false;
-      break;
-    }
+      if (channelId) query = query.eq('channel_id', channelId);
+      if (startTime) query = query.gte('timestamp', startTime);
+      if (endTime) query = query.lt('timestamp', endTime);
 
-    allMessages = allMessages.concat(data);
-    lastId = data[data.length - 1].id;
+      const { data, error } = await query;
 
-    if (data.length < chunkSize) {
-      hasMore = false;
+      if (error) {
+        throw new Error(`fetchMessages Supabase error: ${error.message} (code: ${error.code})`);
+      }
+
+      if (!data || data.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      allMessages = allMessages.concat(data);
+      lastId = data[data.length - 1].id;
+
+      if (data.length < chunkSize) {
+        hasMore = false;
+      }
     }
   }
 

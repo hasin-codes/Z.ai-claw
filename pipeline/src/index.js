@@ -2,7 +2,7 @@ const path = require('path');
 const { randomUUID } = require('crypto');
 
 // Load .env for local development (safe no-op on Railway where vars are injected)
-try { require('dotenv').config(); } catch {}
+try { require('dotenv').config(); } catch { }
 
 const { PIPELINE_CONFIG } = require('../pipeline.config');
 const logger = require('./logger');
@@ -67,6 +67,10 @@ async function bestEffortEmbedAndIndex(segments) {
  *
  * Primary path: fetch → segment → LLM classify → store to Supabase
  * Secondary path (best-effort): embed → Qdrant upsert for retrieval
+ *
+ * On first run (no previous batch in Redis / degraded mode), fetches ALL
+ * existing messages from community_messages_clean without a time window.
+ * Subsequent runs use time-window-based incremental processing.
  */
 async function runPipeline() {
   validateEnv();
@@ -93,20 +97,26 @@ async function runPipeline() {
   try {
     // Determine time window
     const lastBatch = await batchTracker.getLastBatch();
-    const windowHours = PIPELINE_CONFIG.BATCH_WINDOW_HOURS;
     let startTimeISO;
+    let endTimeISO;
+
     if (lastBatch && lastBatch.endTimestamp) {
+      // Normal incremental run — process messages since last batch
       startTimeISO = lastBatch.endTimestamp;
+      endTimeISO = new Date().toISOString();
+      logger.info('orchestrator', 'Incremental run since last batch', {
+        startTimeISO, endTimeISO,
+      });
     } else {
-      // First deploy — do a full backfill (30 days) instead of a small window
-      const backfillDays = parseInt(process.env.PIPELINE_INITIAL_BACKFILL_DAYS, 10) || 30;
-      startTimeISO = new Date(Date.now() - backfillDays * 24 * 3600 * 1000).toISOString();
-      logger.info('orchestrator', `No previous batch found — running initial backfill (${backfillDays} days)`);
+      // FIRST RUN or degraded mode (no Redis) — process ALL existing data
+      // Don't guess a time window; just fetch everything in the clean table
+      startTimeISO = null;
+      endTimeISO = null;
+      logger.info('orchestrator', 'First run — fetching ALL existing cleaned messages (no time filter)');
     }
-    const endTimeISO = new Date().toISOString();
 
     logger.info('orchestrator', 'Pipeline started', {
-      timeWindow: { start: startTimeISO, end: endTimeISO },
+      timeWindow: { start: startTimeISO || 'ALL', end: endTimeISO || 'ALL' },
       degraded: batchTracker.isDegraded(),
     });
 
@@ -115,18 +125,24 @@ async function runPipeline() {
 
     if (messages.length === 0) {
       logger.info('orchestrator', 'No messages to process');
-      await batchTracker.setLastBatch(batchId, endTimeISO);
+      // Only record endTimestamp if we had a real time window
+      if (endTimeISO) {
+        await batchTracker.setLastBatch(batchId, endTimeISO);
+      }
       await batchTracker.setBatchStatus(batchId, 'done', startedAt, new Date().toISOString());
       return;
     }
+
+    logger.info('orchestrator', `Processing ${messages.length} messages`);
 
     // Step 2: Boundary detection → segments
     const segments = await detectBoundariesPipeline(messages);
 
     if (segments.length === 0) {
       logger.info('orchestrator', 'No segments produced');
-      await batchTracker.setLastBatch(batchId, endTimeISO);
-      await batchTracker.setBatchStatus(batchId, 'done', startedAt, new Date().toISOString());
+      const nowISO = new Date().toISOString();
+      await batchTracker.setLastBatch(batchId, nowISO);
+      await batchTracker.setBatchStatus(batchId, 'done', startedAt, nowISO);
       return;
     }
 
@@ -142,8 +158,10 @@ async function runPipeline() {
     await bestEffortEmbedAndIndex(segments);
 
     // Success — update tracking
+    // Use the latest timestamp from the data we just processed
+    const lastMsgTimestamp = messages[messages.length - 1]?.timestamp || new Date().toISOString();
     const durationMs = Date.now() - startTime;
-    await batchTracker.setLastBatch(batchId, endTimeISO);
+    await batchTracker.setLastBatch(batchId, lastMsgTimestamp);
     await batchTracker.setBatchStatus(batchId, 'done', startedAt, new Date().toISOString());
 
     logger.info('orchestrator', 'Pipeline complete', {

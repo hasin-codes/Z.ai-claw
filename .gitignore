@@ -7,6 +7,16 @@
 node_modules/
 package-lock.json
 
+# Environment
+.env
+
+# Logs
+*.log
+
+# Supabase
+supabase/.temp/
+supabase/.env
+
 # Environment variables (NEVER commit these)
 .env
 .env.local

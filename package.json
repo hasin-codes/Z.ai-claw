@@ -27,6 +27,7 @@
   },
   "devDependencies": {
     "jest": "^30.3.0",
+    "supabase": "^2.84.4",
     "typescript": "^5.9.3"
   }
 }

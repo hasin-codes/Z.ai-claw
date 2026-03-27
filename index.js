@@ -26,12 +26,11 @@ const { createReportThread } = require('./lib/forum');
 const { runReminderJob } = require('./lib/reminders');
 const { startWorkers, stopWorkers } = require('./lib/workers');
 const { addForwardJob } = require('./lib/queue');
-const { initCollections } = require('./lib/qdrant');
+const { initCollections, ensureCollection } = require('./lib/qdrant');
 const { runAgent } = require('./lib/agent');
 const { updateThreadBrief } = require('./lib/context');
 const supabase = require('./lib/supabase');
 const ingestion = require('./lib/ingestion');
-const cleaning = require('./lib/cleaning');
 
 // ─── Client setup ────────────────────────────────────────────────────
 const client = new Client({
@@ -57,8 +56,11 @@ for (const file of commandFiles) {
 client.once('clientReady', async () => {
   log.info({ tag: client.user.tag, guilds: client.guilds.cache.size }, 'Bot online');
 
-  // Init Qdrant collections
+  // Init Qdrant collections (bot collections + pipeline collection)
   await initCollections();
+  // Ensure pipeline collection exists for context block storage
+  const pipelineCollection = process.env.QDRANT_PIPELINE_COLLECTION || 'pipeline_contexts';
+  await ensureCollection(pipelineCollection, false);
 
   // Start BullMQ workers — pass client so workers can call Discord API
   startWorkers(client);
@@ -66,49 +68,34 @@ client.once('clientReady', async () => {
   // Init message ingestion system (backfill + batch writer)
   await ingestion.init(client);
 
-  // Start community message cleaning worker (every 5 minutes)
-  cleaning.start();
-
-  // Reminder job every hour + once 30s after startup
+  // ─── Reminder job (stays in bot — needs Discord client) ──────────
+  // Runs every hour + once 30s after startup
   setInterval(() => runReminderJob(client), 60 * 60 * 1000);
   setTimeout(() => runReminderJob(client), 30 * 1000);
 
-  // Run backfill pipeline on first deployment (processes historical data)
-  // Only runs if AUTO_BACKFILL=true is set in Railway env vars
-  if (process.env.AUTO_BACKFILL === 'true') {
-    setTimeout(async () => {
-      try {
-        log.info('[backfill] Running initial backfill pipeline...');
-        log.info('[backfill] Processing last 30 days of messages...');
-        
-        const { backfill } = require('./scripts/backfill-pipeline');
-        await backfill();
-        
-        log.info('[backfill] Backfill complete!');
-        log.info('[backfill] Disabling auto-backfill (set AUTO_BACKFILL=true to run again)');
-        
-        // Disable after first run to prevent re-running on restarts
-        // User can manually set AUTO_BACKFILL=true again if needed
-      } catch (err) {
-        log.error('[backfill] Backfill failed:', {
-          message: err.message,
-          stack: err.stack?.slice(0, 1000),
-        });
-        // Don't crash bot - backfill failure is non-critical
-      }
-    }, 120000); // Wait 2 minutes after bot starts
-  }
+  // ─── Cleaning: handled by Supabase Edge Function ───────────────────
+  // See: supabase/functions/cleaning-cron/     (every 5 min via pg_cron)
+  //      supabase/functions/retention-cleanup/ (daily via pg_cron)
+  //      sql/setup_cron_jobs.sql               (cron schedule definitions)
 
-  // Run semantic analysis pipeline on startup (then every 12 hours via cron)
-  // This processes any messages since last run
+  // ─── Pipeline: runs on Railway (needs compute + Python + no timeout) ──
+  // The pipeline processes cleaned messages from Supabase, does:
+  //   1. Embed all messages (Cloudflare AI)
+  //   2. TextTiling boundary detection for topic segmentation
+  //   3. LLM classification of segments into topic clusters
+  //   4. Store results to Supabase (pipeline_clusters, pipeline_cluster_messages, pipeline_topic_summaries)
+  //   5. Embed context blocks and upsert to Qdrant (pipeline_contexts collection)
+  //
+  // On startup: run pipeline once to process existing/new cleaned messages
+  // Then schedule to run every 12 hours for incremental processing
   setTimeout(async () => {
     try {
       log.info('[pipeline] Running initial pipeline on startup...');
       const { runPipeline } = require('./pipeline/src/index');
       await runPipeline();
       log.info('[pipeline] Initial pipeline complete');
-      
-      // Schedule pipeline to run every 12 hours
+
+      // Schedule pipeline to run every 12 hours for incremental processing
       setInterval(async () => {
         try {
           log.info('[pipeline] Running scheduled pipeline...');
@@ -121,22 +108,23 @@ client.once('clientReady', async () => {
           });
         }
       }, 12 * 60 * 60 * 1000); // 12 hours
-      
+
     } catch (err) {
       log.error('[pipeline] Initial pipeline failed:', {
         message: err.message,
         stack: err.stack?.slice(0, 1000),
         code: err.code,
       });
-      // Don't crash bot - pipeline failure is non-critical
+      // Don't crash bot — pipeline failure is non-critical
     }
   }, 60000); // Wait 1 minute after bot starts
+
+  log.info('Bot ready — pipeline runs on Railway, cleaning/retention via edge functions');
 });
 
 // Graceful shutdown — close workers cleanly when process exits
 process.on('SIGTERM', async () => {
   log.info('SIGTERM received — shutting down gracefully');
-  cleaning.stop();
   await ingestion.shutdown();
   await stopWorkers();
   process.exit(0);
@@ -144,7 +132,6 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   log.info('SIGINT received — shutting down gracefully');
-  cleaning.stop();
   await ingestion.shutdown();
   await stopWorkers();
   process.exit(0);
@@ -299,8 +286,6 @@ client.on('threadCreate', async (thread, newlyCreated) => {
 });
 
 // ─── Thread message listener ──────────────────────────────────────────
-// Drop this entire block into index.js replacing the existing messageCreate handler
-
 client.on('messageCreate', async message => {
   // Community message ingestion (non-blocking, filtered internally)
   ingestion.handleMessage(message);

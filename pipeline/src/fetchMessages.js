@@ -16,23 +16,26 @@ const COLUMNS = 'id, message_id, channel_id, user_id, username, content, timesta
  * Uses cursor-based pagination by `id` (BIGSERIAL, guaranteed monotonic).
  * 
  * If GENERAL_CHAT_CHANNEL_ID is not set, fetches from ALL channels.
+ * If startTime is null, fetches ALL messages (no time window — used for first run
+ * when existing data is already in the table).
  *
- * @param {string} startTime - ISO timestamp for window start
- * @param {string} endTime   - ISO timestamp for window end
+ * @param {string|null} startTime - ISO timestamp for window start, or null for all
+ * @param {string|null} endTime   - ISO timestamp for window end, or null for all
  * @returns {Promise<Array>} chronologically sorted message objects
  */
 async function fetchMessages(startTime, endTime) {
   const channelId = process.env.GENERAL_CHAT_CHANNEL_ID;
   const chunkSize = PIPELINE_CONFIG.FETCH_CHUNK_SIZE;
-  const backfillHours = process.env.PIPELINE_BACKFILL_HOURS 
-    ? parseInt(process.env.PIPELINE_BACKFILL_HOURS, 10) 
+  const backfillHours = process.env.PIPELINE_BACKFILL_HOURS
+    ? parseInt(process.env.PIPELINE_BACKFILL_HOURS, 10)
     : PIPELINE_CONFIG.BATCH_WINDOW_HOURS;
-  
+
   let allMessages = [];
   let lastId = 0;
   let hasMore = true;
 
-  logger.info('fetchMessages', `Fetching messages (backfill: ${backfillHours}h, channel: ${channelId || 'ALL'})`);
+  const mode = startTime ? `backfill: ${backfillHours}h` : 'ALL (no time filter)';
+  logger.info('fetchMessages', `Fetching messages (${mode}, channel: ${channelId || 'ALL'})`);
 
   while (hasMore) {
     let query = supabase
@@ -47,8 +50,13 @@ async function fetchMessages(startTime, endTime) {
       query = query.eq('channel_id', channelId);
     }
 
-    // Apply time window
-    query = query.gte('timestamp', startTime).lt('timestamp', endTime);
+    // Apply time window ONLY if startTime/endTime are provided
+    if (startTime) {
+      query = query.gte('timestamp', startTime);
+    }
+    if (endTime) {
+      query = query.lt('timestamp', endTime);
+    }
 
     const { data, error } = await query;
 
@@ -70,8 +78,8 @@ async function fetchMessages(startTime, endTime) {
   }
 
   logger.info('fetchMessages', `Fetched ${allMessages.length} messages`, {
-    startTime,
-    endTime,
+    startTime: startTime || 'ALL',
+    endTime: endTime || 'ALL',
     channelId: channelId || 'ALL',
     chunks: Math.ceil(allMessages.length / chunkSize) || 0,
   });

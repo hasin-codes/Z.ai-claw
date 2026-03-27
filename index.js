@@ -72,6 +72,32 @@ client.once('clientReady', async () => {
   // Reminder job every hour + once 30s after startup
   setInterval(() => runReminderJob(client), 60 * 60 * 1000);
   setTimeout(() => runReminderJob(client), 30 * 1000);
+
+  // Run semantic analysis pipeline on startup (then every 12 hours via cron)
+  // This processes any messages since last run
+  setTimeout(async () => {
+    try {
+      log.info('[pipeline] Running initial pipeline on startup...');
+      const { runPipeline } = require('./pipeline/src/index');
+      await runPipeline();
+      log.info('[pipeline] Initial pipeline complete');
+      
+      // Schedule pipeline to run every 12 hours
+      setInterval(async () => {
+        try {
+          log.info('[pipeline] Running scheduled pipeline...');
+          await runPipeline();
+          log.info('[pipeline] Scheduled pipeline complete');
+        } catch (err) {
+          log.error('[pipeline] Scheduled pipeline failed:', err.message);
+        }
+      }, 12 * 60 * 60 * 1000); // 12 hours
+      
+    } catch (err) {
+      log.error('[pipeline] Initial pipeline failed:', err.message);
+      // Don't crash bot - pipeline failure is non-critical
+    }
+  }, 60000); // Wait 1 minute after bot starts
 });
 
 // Graceful shutdown — close workers cleanly when process exits

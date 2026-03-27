@@ -6,6 +6,52 @@ const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
 const COLLECTION_NAME = process.env.QDRANT_PIPELINE_COLLECTION;
 
 /**
+ * Ensure collection exists, create if not.
+ */
+async function ensureCollectionExists() {
+  try {
+    // Check if collection exists
+    const res = await fetch(`${QDRANT_URL}/collections/${COLLECTION_NAME}`, {
+      headers: { 'api-key': QDRANT_API_KEY }
+    });
+    
+    if (res.ok) {
+      logger.info('qdrantClient', `Collection ${COLLECTION_NAME} exists`);
+      return;
+    }
+    
+    if (res.status === 404) {
+      // Collection doesn't exist, create it
+      logger.info('qdrantClient', `Creating collection ${COLLECTION_NAME}...`);
+      
+      const createRes = await fetch(`${QDRANT_URL}/collections/${COLLECTION_NAME}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': QDRANT_API_KEY,
+        },
+        body: JSON.stringify({
+          vectors: {
+            size: 1024, // BGE-Large embedding dimension
+            distance: 'Cosine',
+          },
+        }),
+      });
+      
+      if (!createRes.ok) {
+        const errText = await createRes.text();
+        throw new Error(`Failed to create collection: ${createRes.status} ${errText.slice(0, 300)}`);
+      }
+      
+      logger.info('qdrantClient', `Collection ${COLLECTION_NAME} created successfully`);
+    }
+  } catch (err) {
+    logger.error('qdrantClient', `Collection check/create failed: ${err.message}`);
+    throw err;
+  }
+}
+
+/**
  * Upsert context blocks into Qdrant in batches.
  *
  * @param {Array<{contextBlockId: string, vector: number[], anchorMessageId: string, segmentIndex: number, segmentBoundaryScore: number|null, messageIds: string[], channelId: string, startTimestamp: string, endTimestamp: string, contextText: string}>} blocks
@@ -13,6 +59,9 @@ const COLLECTION_NAME = process.env.QDRANT_PIPELINE_COLLECTION;
  */
 async function upsertBlocks(blocks, batchId) {
   if (blocks.length === 0) return;
+  
+  // Ensure collection exists before upserting
+  await ensureCollectionExists();
 
   const batchSize = PIPELINE_CONFIG.QDRANT_UPSERT_BATCH_SIZE;
   const maxRetries = PIPELINE_CONFIG.QDRANT_RETRY_COUNT;
@@ -131,4 +180,4 @@ async function fetchBatchPoints(batchId) {
   return allPoints;
 }
 
-module.exports = { upsertBlocks, fetchBatchPoints };
+module.exports = { upsertBlocks, fetchBatchPoints, ensureCollectionExists };

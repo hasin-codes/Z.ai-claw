@@ -14,6 +14,8 @@ const COLUMNS = 'id, message_id, channel_id, user_id, username, content, timesta
 /**
  * Fetch cleaned messages from Supabase for the batch window.
  * Uses cursor-based pagination by `id` (BIGSERIAL, guaranteed monotonic).
+ * 
+ * If GENERAL_CHAT_CHANNEL_ID is not set, fetches from ALL channels.
  *
  * @param {string} startTime - ISO timestamp for window start
  * @param {string} endTime   - ISO timestamp for window end
@@ -22,20 +24,31 @@ const COLUMNS = 'id, message_id, channel_id, user_id, username, content, timesta
 async function fetchMessages(startTime, endTime) {
   const channelId = process.env.GENERAL_CHAT_CHANNEL_ID;
   const chunkSize = PIPELINE_CONFIG.FETCH_CHUNK_SIZE;
+  const backfillHours = process.env.PIPELINE_BACKFILL_HOURS 
+    ? parseInt(process.env.PIPELINE_BACKFILL_HOURS, 10) 
+    : PIPELINE_CONFIG.BATCH_WINDOW_HOURS;
+  
   let allMessages = [];
   let lastId = 0;
   let hasMore = true;
+
+  logger.info('fetchMessages', `Fetching messages (backfill: ${backfillHours}h, channel: ${channelId || 'ALL'})`);
 
   while (hasMore) {
     let query = supabase
       .from('community_messages_clean')
       .select(COLUMNS)
-      .eq('channel_id', channelId)
-      .gte('timestamp', startTime)
-      .lt('timestamp', endTime)
       .gt('id', lastId)
       .order('id', { ascending: true })
       .limit(chunkSize);
+
+    // Only filter by channel if GENERAL_CHAT_CHANNEL_ID is set
+    if (channelId) {
+      query = query.eq('channel_id', channelId);
+    }
+
+    // Apply time window
+    query = query.gte('timestamp', startTime).lt('timestamp', endTime);
 
     const { data, error } = await query;
 
@@ -56,14 +69,10 @@ async function fetchMessages(startTime, endTime) {
     }
   }
 
-  // Verify chronological order (should be guaranteed by ORDER BY id ASC,
-  // but id is BIGSERIAL which matches insertion order ≈ timestamp order)
-  // No need to re-sort — id ordering is sufficient for boundary detection
-
   logger.info('fetchMessages', `Fetched ${allMessages.length} messages`, {
     startTime,
     endTime,
-    channelId,
+    channelId: channelId || 'ALL',
     chunks: Math.ceil(allMessages.length / chunkSize) || 0,
   });
 

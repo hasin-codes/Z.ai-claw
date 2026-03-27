@@ -73,6 +73,32 @@ client.once('clientReady', async () => {
   setInterval(() => runReminderJob(client), 60 * 60 * 1000);
   setTimeout(() => runReminderJob(client), 30 * 1000);
 
+  // Run backfill pipeline on first deployment (processes historical data)
+  // Only runs if AUTO_BACKFILL=true is set in Railway env vars
+  if (process.env.AUTO_BACKFILL === 'true') {
+    setTimeout(async () => {
+      try {
+        log.info('[backfill] Running initial backfill pipeline...');
+        log.info('[backfill] Processing last 30 days of messages...');
+        
+        const { backfill } = require('./scripts/backfill-pipeline');
+        await backfill();
+        
+        log.info('[backfill] Backfill complete!');
+        log.info('[backfill] Disabling auto-backfill (set AUTO_BACKFILL=true to run again)');
+        
+        // Disable after first run to prevent re-running on restarts
+        // User can manually set AUTO_BACKFILL=true again if needed
+      } catch (err) {
+        log.error('[backfill] Backfill failed:', {
+          message: err.message,
+          stack: err.stack?.slice(0, 1000),
+        });
+        // Don't crash bot - backfill failure is non-critical
+      }
+    }, 120000); // Wait 2 minutes after bot starts
+  }
+
   // Run semantic analysis pipeline on startup (then every 12 hours via cron)
   // This processes any messages since last run
   setTimeout(async () => {

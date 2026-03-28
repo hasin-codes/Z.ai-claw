@@ -52,9 +52,14 @@ async function fetchMessages(startTime, endTime) {
     let query = supabase
       .from('community_messages_clean')
       .select(COLUMNS)
-      .lt('id', lastId === 0 ? Infinity : lastId)
       .order('id', { ascending: false })
       .limit(chunkSize);
+
+    // For first iteration (lastId=0), no ID filter - just get newest messages
+    // For subsequent iterations, get messages older than last fetched ID
+    if (lastId > 0) {
+      query = query.lt('id', lastId);
+    }
 
     if (channelId) query = query.eq('channel_id', channelId);
     if (startTime) query = query.gte('timestamp', startTime);

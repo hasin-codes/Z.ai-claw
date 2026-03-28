@@ -37,7 +37,7 @@ async function fetchMessages(startTime, endTime) {
   const mode = startTime ? `backfill: ${backfillHours}h` : 'ALL (no time filter)';
   logger.info('fetchMessages', `Fetching messages (${mode}, channel: ${channelId || 'ALL'})`);
 
-  // LIMIT_HISTORY: if not 'false', caps "ALL" mode to latest 5000 messages
+  // LIMIT_HISTORY: if not 'false', caps "ALL" mode to latest 2000 messages
   // When LIMIT_HISTORY=false, fetches everything with no cap (paginated loop handles it)
   const forceLimit = process.env.LIMIT_HISTORY !== 'false';
   const maxMessages = forceLimit ? 2000 : Infinity;
@@ -47,12 +47,13 @@ async function fetchMessages(startTime, endTime) {
   }
 
   // Unified paginated fetch — works for both capped and uncapped, both timed and ALL modes
+  // FIXED: Fetch from highest ID downward to get LATEST messages first
   while (hasMore) {
     let query = supabase
       .from('community_messages_clean')
       .select(COLUMNS)
-      .gt('id', lastId)
-      .order('id', { ascending: true })
+      .lt('id', lastId === 0 ? Infinity : lastId)
+      .order('id', { ascending: false })
       .limit(chunkSize);
 
     if (channelId) query = query.eq('channel_id', channelId);
@@ -70,7 +71,8 @@ async function fetchMessages(startTime, endTime) {
       break;
     }
 
-    allMessages = allMessages.concat(data);
+    // Prepend to maintain chronological order (since we're fetching newest first)
+    allMessages = [...data.reverse(), ...allMessages];
     lastId = data[data.length - 1].id;
 
     if (data.length < chunkSize) {

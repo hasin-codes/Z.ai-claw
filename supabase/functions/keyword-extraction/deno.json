@@ -1,0 +1,11 @@
+{
+  "importMap": "../deno.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "lib": ["deno.ns", "dom"],
+    "strict": true
+  },
+  "tasks": {
+    "serve": "deno run --allow-all --watch index.ts"
+  }
+}

@@ -28,7 +28,69 @@ const { startWorkers, stopWorkers } = require('./lib/workers');
 const { addForwardJob } = require('./lib/queue');
 const { initCollections, ensureCollection } = require('./lib/qdrant');
 const { runAgent } = require('./lib/agent');
-const { updateThreadBrief } = require('./lib/context');
+
+// ── Auto-reply timer: accumulate user messages, answer after 45s of silence ──
+const AUTO_REPLY_DELAY_MS = 45_000;
+// threadId → { timer, accumulatedMessages: string[], issue, discordClient, member }
+const _pendingAutoReplies = new Map();
+
+function scheduleAutoReply(threadId, discordClient, issue, userMessage, member) {
+  // Clear any existing timer for this thread
+  if (_pendingAutoReplies.has(threadId)) {
+    clearTimeout(_pendingAutoReplies.get(threadId).timer);
+  }
+
+  const entry = {
+    timer: null,
+    accumulatedMessages: [userMessage],
+    issue,
+    discordClient,
+    member
+  };
+
+  entry.timer = setTimeout(async () => {
+    _pendingAutoReplies.delete(threadId);
+    try {
+      const liveThread = await discordClient.channels.fetch(threadId);
+      if (!liveThread) return;
+      await liveThread.sendTyping();
+      const combined = entry.accumulatedMessages.join('\n\n');
+      await runAgent(discordClient, liveThread, issue, combined, member);
+      console.log(`[autoReply] Sent RAG reply in thread ${threadId} for ${issue.short_id} (${entry.accumulatedMessages.length} messages accumulated)`);
+    } catch (err) {
+      console.error(`[autoReply] Failed in thread ${threadId}:`, err.message);
+    }
+  }, AUTO_REPLY_DELAY_MS);
+
+  _pendingAutoReplies.set(threadId, entry);
+}
+
+/**
+ * Append a follow-up message to the pending auto-reply and reset the 45s timer.
+ * Returns true if a pending auto-reply existed (caller should NOT run agent).
+ * Returns false if no pending auto-reply (caller should run agent normally).
+ */
+function accumulateAutoReply(threadId, newMessage) {
+  if (!_pendingAutoReplies.has(threadId)) return false;
+  const entry = _pendingAutoReplies.get(threadId);
+  clearTimeout(entry.timer);
+  entry.accumulatedMessages.push(newMessage);
+  entry.timer = setTimeout(async () => {
+    _pendingAutoReplies.delete(threadId);
+    try {
+      const liveThread = await discordClient.channels.fetch(threadId);
+      if (!liveThread) return;
+      await liveThread.sendTyping();
+      const combined = entry.accumulatedMessages.join('\n\n');
+      await runAgent(entry.discordClient, liveThread, entry.issue, combined, entry.member);
+      console.log(`[autoReply] Sent RAG reply in thread ${threadId} for ${entry.issue.short_id} (${entry.accumulatedMessages.length} messages accumulated)`);
+    } catch (err) {
+      console.error(`[autoReply] Failed in thread ${threadId}:`, err.message);
+    }
+  }, AUTO_REPLY_DELAY_MS);
+  return true;
+}
+const {} = require('./lib/context'); // thread brief exports disabled
 const supabase = require('./lib/supabase');
 const ingestion = require('./lib/ingestion');
 
@@ -277,19 +339,22 @@ client.on('threadCreate', async (thread, newlyCreated) => {
     console.error('[threadCreate] Could not ping role:', err.message);
   }
 
+  // Schedule auto-reply: answer the user's initial message after 45s if they don't send another
+  scheduleAutoReply(thread.id, client, issue, threadContent, { id: user.id });
+
   // Queue the forward job instead of calling directly
   await addForwardJob({
     issueId: issue.short_id,
     userId: user.id
   });
 
-  // Fix 2: Create initial thread brief
-  try {
-    const allIssues = await getAllThreadIssues(thread.id);
-    await updateThreadBrief(thread, allIssues, client.user.id);
-  } catch (err) {
-    console.warn('[threadCreate] Could not create initial brief:', err.message);
-  }
+  // Fix 2: Create initial thread brief — DISABLED
+  // try {
+  //   const allIssues = await getAllThreadIssues(thread.id);
+  //   await updateThreadBrief(thread, allIssues, client.user.id);
+  // } catch (err) {
+  //   console.warn('[threadCreate] Could not create initial brief:', err.message);
+  // }
 
   console.log(`[threadCreate] Issue ${issue.short_id} created and processed`);
 });
@@ -307,6 +372,17 @@ client.on('messageCreate', async message => {
 
   const content = message.content.trim();
   if (!content) return;
+
+  // If there's a pending auto-reply, accumulate this message and reset the 45s timer
+  // (don't run agent — the timer will fire after silence)
+  if (accumulateAutoReply(thread.id, content)) {
+    // Still save the message to DB for history, using the issue from the pending entry
+    const pendingEntry = _pendingAutoReplies.get(thread.id);
+    if (pendingEntry) {
+      await saveMessage({ issueId: pendingEntry.issue.id, role: 'user', content, discordMsgId: message.id });
+    }
+    return;
+  }
 
   // ── Fix 1: Multi-user routing ──────────────────────────────────────
   // First, look for the PRIMARY issue in this thread
@@ -466,12 +542,16 @@ async function handleReportModal(interaction) {
       const liveThread = await interaction.client.channels.fetch(thread.id);
       await pingRoleInThread(interaction.client, liveThread, issue, 'new_issue');
 
-      // Fix 2: Create initial thread brief
-      const allIssues = await getAllThreadIssues(thread.id);
-      await updateThreadBrief(liveThread, allIssues, interaction.client.user.id);
+      // Fix 2: Create initial thread brief — DISABLED
+      // const allIssues = await getAllThreadIssues(thread.id);
+      // await updateThreadBrief(liveThread, allIssues, interaction.client.user.id);
     } catch (err) {
       console.error('Could not ping role or create brief in thread:', err.message);
     }
+
+    // Schedule auto-reply: answer the user's initial message after 45s if they don't send another
+    const initialContent = `Title: ${title}\nDescription: ${description}${stepsTried ? `\nSteps tried: ${stepsTried}` : ''}`;
+    scheduleAutoReply(thread.id, interaction.client, issue, initialContent, { id: user.id });
   }
 
   // Queue the forward job instead of calling directly

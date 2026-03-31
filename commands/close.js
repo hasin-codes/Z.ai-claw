@@ -52,9 +52,9 @@ module.exports = {
         const thread = await interaction.client.channels.fetch(issue.thread_id);
         if (thread) {
           await unpinEscalationEmbed(thread);
-          // Fix 5: Update thread brief on close
-          const allIssues = await getAllThreadIssues(issue.thread_id);
-          await updateThreadBrief(thread, allIssues, interaction.client.user.id);
+          // Fix 5: Update thread brief on close — DISABLED
+          // const allIssues = await getAllThreadIssues(issue.thread_id);
+          // await updateThreadBrief(thread, allIssues, interaction.client.user.id);
         }
       } catch (err) {
         console.warn(`[close] Could not update thread for ${issue.short_id}:`, err.message);

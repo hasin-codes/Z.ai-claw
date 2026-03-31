@@ -42,18 +42,18 @@ module.exports = {
       note: 'A team member has seen your issue and will look into it.'
     });
 
-    // Fix 5: Update thread brief on status change
-    if (issue.thread_id) {
-      try {
-        const thread = await interaction.client.channels.fetch(issue.thread_id);
-        if (thread) {
-          const allIssues = await getAllThreadIssues(issue.thread_id);
-          await updateThreadBrief(thread, allIssues, interaction.client.user.id);
-        }
-      } catch (err) {
-        console.warn(`[acknowledge] Could not update brief for ${issue.short_id}:`, err.message);
-      }
-    }
+    // Fix 5: Update thread brief on status change — DISABLED
+    // if (issue.thread_id) {
+    //   try {
+    //     const thread = await interaction.client.channels.fetch(issue.thread_id);
+    //     if (thread) {
+    //       const allIssues = await getAllThreadIssues(issue.thread_id);
+    //       await updateThreadBrief(thread, allIssues, interaction.client.user.id);
+    //     }
+    //   } catch (err) {
+    //     console.warn(`[acknowledge] Could not update brief for ${issue.short_id}:`, err.message);
+    //   }
+    // }
 
     await interaction.editReply({
       content: `**${issue.short_id}** marked as acknowledged. User will be notified.`
